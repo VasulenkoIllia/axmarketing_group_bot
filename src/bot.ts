@@ -68,6 +68,7 @@ bot.command('start', async (ctx) => {
     '<b>Команди:</b>\n' +
     '/broadcast — надіслати повідомлення в групу\n' +
     '/scheduled — заплановані розсилки\n' +
+    '/checkgroup — перевірити доступ бота до групи\n' +
     '/cancel — скасувати поточну дію';
 
   await ctx.reply(text, { parse_mode: 'HTML' });
@@ -85,10 +86,68 @@ bot.command('help', async (ctx) => {
       '<b>Команди:</b>\n' +
       '/broadcast — запустити розсилку\n' +
       '/scheduled — переглянути та скасувати заплановані розсилки\n' +
+      '/checkgroup — перевірити доступ бота до групи\n' +
       '/cancel — скасувати поточну дію\n\n' +
       '⚠️ Час відправки — київський. Заплановані розсилки скасовуються при перезапуску бота.',
     { parse_mode: 'HTML' },
   );
+});
+
+// ─── /checkgroup ──────────────────────────────────────────────────────────────
+
+bot.command('checkgroup', async (ctx) => {
+  if (!isAdmin(ctx.chat.id)) return;
+
+  try {
+    const botId = ctx.me.id;
+    const [chatInfo, member] = await Promise.all([
+      bot.api.getChat(config.groupChatId),
+      bot.api.getChatMember(config.groupChatId, botId),
+    ]);
+
+    const groupTitle = 'title' in chatInfo ? chatInfo.title : String(config.groupChatId);
+
+    if (member.status === 'left' || member.status === 'kicked') {
+      await ctx.reply(
+        `❌ Бот не є учасником групи <b>${groupTitle}</b>.\nДодайте бота в групу.`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (member.status === 'restricted') {
+      await ctx.reply(
+        `⚠️ Бот обмежений в групі <b>${groupTitle}</b> і не може надсилати повідомлення.`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (member.status === 'administrator') {
+      const canPost = (member as { can_post_messages?: boolean }).can_post_messages !== false;
+      if (!canPost) {
+        await ctx.reply(
+          `⚠️ Бот є адміністратором в <b>${groupTitle}</b>, але право "Надсилати повідомлення" вимкнено.`,
+          { parse_mode: 'HTML' },
+        );
+        return;
+      }
+      await ctx.reply(
+        `✅ Бот — адміністратор в <b>${groupTitle}</b>. Все ок.`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    // member
+    await ctx.reply(
+      `✅ Бот є учасником групи <b>${groupTitle}</b> і може надсилати повідомлення.`,
+      { parse_mode: 'HTML' },
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await ctx.reply(`❌ Не вдалося перевірити групу: ${msg}`);
+  }
 });
 
 // ─── /broadcast ───────────────────────────────────────────────────────────────
