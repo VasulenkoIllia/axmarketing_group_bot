@@ -1,7 +1,10 @@
-import { Bot, InlineKeyboard } from 'grammy';
+import { Bot, GrammyError, InlineKeyboard } from 'grammy';
 import { config } from './config';
 import { PendingMessage, ScheduledBroadcast } from './types';
 import { formatKyivTime, nextOccurrenceKyiv, isTomorrow, token } from './utils';
+
+/** Mutable target group ID — updated automatically on supergroup migration. */
+let groupChatId = config.groupChatId;
 
 export const bot = new Bot(config.botToken);
 
@@ -38,13 +41,35 @@ function buildConfirmKeyboard(): InlineKeyboard {
 }
 
 async function sendToGroup(pending: PendingMessage): Promise<void> {
-  await bot.api.copyMessage(config.groupChatId, pending.sourceChatId, pending.messageId);
+  try {
+    await bot.api.copyMessage(groupChatId, pending.sourceChatId, pending.messageId);
+  } catch (err) {
+    if (!(err instanceof GrammyError)) throw err;
+
+    // Group was upgraded to a supergroup — Telegram provides the new chat ID
+    const newChatId = (err.parameters as { migrate_to_chat_id?: number })?.migrate_to_chat_id;
+    if (newChatId) {
+      groupChatId = newChatId;
+      await bot.api.copyMessage(newChatId, pending.sourceChatId, pending.messageId);
+      return;
+    }
+
+    throw err;
+  }
 }
 
 async function executeSend(adminChatId: number, pending: PendingMessage): Promise<void> {
+  const prevId = groupChatId;
   try {
     await sendToGroup(pending);
-    await bot.api.sendMessage(adminChatId, '✅ Повідомлення надіслано в групу.');
+    let text = '✅ Повідомлення надіслано в групу.';
+    if (groupChatId !== prevId) {
+      text +=
+        `\n\n⚠️ Група була конвертована в супергрупу.\n` +
+        `Новий ID: <code>${groupChatId}</code>\n` +
+        `Оновіть <b>GROUP_CHAT_ID</b> в .env і перезапустіть бота.`;
+    }
+    await bot.api.sendMessage(adminChatId, text, { parse_mode: 'HTML' });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await bot.api.sendMessage(adminChatId, `❌ Помилка при відправці: ${msg}`);
@@ -101,8 +126,8 @@ bot.command('checkgroup', async (ctx) => {
   try {
     const botId = ctx.me.id;
     const [chatInfo, member] = await Promise.all([
-      bot.api.getChat(config.groupChatId),
-      bot.api.getChatMember(config.groupChatId, botId),
+      bot.api.getChat(groupChatId),
+      bot.api.getChatMember(groupChatId, botId),
     ]);
 
     const groupTitle = 'title' in chatInfo ? chatInfo.title : String(config.groupChatId);
