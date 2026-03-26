@@ -135,6 +135,9 @@ function scheduleAndStore(
 bot.command('start', async (ctx) => {
   if (!isAdmin(ctx.chat.id)) return;
 
+  // Clear any stuck session state (e.g. admin closed bot mid-flow)
+  clearSession(ctx.chat.id);
+
   const scheduled = [...scheduledBroadcasts.values()].filter(
     (s) => s.adminChatId === ctx.chat.id,
   );
@@ -455,14 +458,14 @@ bot.on('callback_query:data', async (ctx) => {
     const minutes = data === 'sched_30' ? 30 : data === 'sched_60' ? 60 : 120;
     const fireAt = new Date(Date.now() + minutes * 60_000);
     const label = formatScheduleLabel(fireAt);
-    const schedMsgId = ctx.callbackQuery.message?.message_id ?? 0;
 
-    await ctx.editMessageText(
+    const edited = await ctx.editMessageText(
       `⏰ Заплановано на <b>${label}</b>.\n/scheduled — керувати розсилками`,
       { parse_mode: 'HTML' },
     );
     await ctx.answerCallbackQuery(`Заплановано на ${label}`);
 
+    const schedMsgId = typeof edited === 'object' ? edited.message_id : (ctx.callbackQuery.message?.message_id ?? 0);
     scheduleAndStore(chatId, pending, fireAt, label, schedMsgId);
     return;
   }

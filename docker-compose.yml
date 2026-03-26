@@ -9,6 +9,13 @@ services:
     environment:
       - TZ=Europe/Kyiv
 
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('https').get('https://api.telegram.org', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
     logging:
       driver: json-file
       options:

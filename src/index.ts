@@ -1,14 +1,17 @@
 import { bot } from './bot';
 import { config } from './config';
 
+// Fail fast if the container timezone is not set to Kyiv — all scheduling depends on it.
+const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+if (tz !== 'Europe/Kyiv') {
+  throw new Error(
+    `[Bot] Timezone must be Europe/Kyiv, got "${tz}". Set TZ=Europe/Kyiv in your environment.`,
+  );
+}
+
 async function checkGroupAccess(): Promise<void> {
   const botId = (await bot.api.getMe()).id;
   const member = await bot.api.getChatMember(config.groupChatId, botId);
-
-  const canPost =
-    member.status === 'administrator'
-      ? (member as { can_post_messages?: boolean }).can_post_messages !== false
-      : member.status === 'member';
 
   if (member.status === 'left' || member.status === 'kicked') {
     console.error(`[Bot] ERROR: bot is not a member of group ${config.groupChatId}. Add the bot to the group first.`);
@@ -20,9 +23,13 @@ async function checkGroupAccess(): Promise<void> {
     process.exit(1);
   }
 
-  if (!canPost) {
-    console.error(`[Bot] ERROR: bot is an administrator in group ${config.groupChatId} but "Post Messages" permission is disabled.`);
-    process.exit(1);
+  // creator can always post; administrator needs can_post_messages; member can post in regular groups
+  if (member.status === 'administrator') {
+    const canPost = (member as { can_post_messages?: boolean }).can_post_messages !== false;
+    if (!canPost) {
+      console.error(`[Bot] ERROR: bot is an administrator in group ${config.groupChatId} but "Post Messages" permission is disabled.`);
+      process.exit(1);
+    }
   }
 
   console.log(`[Bot] Group access OK (status: ${member.status})`);

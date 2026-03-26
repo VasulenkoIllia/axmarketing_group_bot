@@ -26,14 +26,8 @@ export function nextOccurrenceKyiv(hour: number, minute: number): Date {
   return d;
 }
 
-export function isTomorrow(date: Date): boolean {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  return date.getDate() === tomorrow.getDate();
-}
-
 export function token(): string {
-  return crypto.randomBytes(4).toString('hex');
+  return crypto.randomBytes(8).toString('hex');
 }
 
 /**
