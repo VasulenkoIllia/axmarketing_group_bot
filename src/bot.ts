@@ -1,20 +1,30 @@
 import { Bot, GrammyError, InlineKeyboard } from 'grammy';
 import { config } from './config';
 import { PendingMessage, ScheduledBroadcast } from './types';
-import { formatKyivTime, nextOccurrenceKyiv, isTomorrow, token } from './utils';
+import { formatScheduleLabel, parseDate, token } from './utils';
 
 /** Mutable target group ID — updated automatically on supergroup migration. */
 let groupChatId = config.groupChatId;
+
+export function getGroupChatId(): number {
+  return groupChatId;
+}
 
 export const bot = new Bot(config.botToken);
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
 
-/** Admin has triggered /broadcast and we wait for their message. */
+/** Admin triggered /broadcast — waiting for them to send the message content. */
 const waitingForContent = new Set<number>();
 
-/** Admin typed "Свій час" and we wait for a HH:MM reply. */
-const waitingForCustomTime = new Set<number>();
+/** Admin chose a date — waiting for HH:MM input. */
+const waitingForTimeInput = new Set<number>();
+
+/** Admin chose "Інша дата" — waiting for DD.MM[.YYYY] input. */
+const waitingForDateInput = new Set<number>();
+
+/** Stores the chosen date (midnight) while admin is entering HH:MM. */
+const pendingScheduleDate = new Map<number, Date>();
 
 /** Message staged for sending, keyed by admin chat id. */
 const pendingMessages = new Map<number, PendingMessage>();
@@ -28,6 +38,14 @@ function isAdmin(chatId: number): boolean {
   return chatId === config.adminChatId;
 }
 
+function clearSession(chatId: number): void {
+  waitingForContent.delete(chatId);
+  waitingForTimeInput.delete(chatId);
+  waitingForDateInput.delete(chatId);
+  pendingScheduleDate.delete(chatId);
+  pendingMessages.delete(chatId);
+}
+
 function buildConfirmKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
     .text('✅ Надіслати зараз', 'send_now')
@@ -36,6 +54,16 @@ function buildConfirmKeyboard(): InlineKeyboard {
     .text('⏰ +1 год', 'sched_60')
     .text('⏰ +2 год', 'sched_120')
     .text('🕐 Свій час', 'sched_custom')
+    .row()
+    .text('❌ Скасувати', 'cancel_broadcast');
+}
+
+function buildDatePickerKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('📅 Сьогодні', 'sched_today')
+    .text('📅 Завтра', 'sched_tomorrow')
+    .row()
+    .text('📅 Інша дата (ДД.ММ)', 'sched_date')
     .row()
     .text('❌ Скасувати', 'cancel_broadcast');
 }
@@ -74,6 +102,32 @@ async function executeSend(adminChatId: number, pending: PendingMessage): Promis
     const msg = err instanceof Error ? err.message : String(err);
     await bot.api.sendMessage(adminChatId, `❌ Помилка при відправці: ${msg}`);
   }
+}
+
+function scheduleAndStore(
+  chatId: number,
+  pending: PendingMessage,
+  fireAt: Date,
+  label: string,
+  statusMessageId: number,
+): void {
+  const schedToken = token();
+  const delayMs = fireAt.getTime() - Date.now();
+  const capturedPending = { ...pending };
+
+  const timerHandle = setTimeout(async () => {
+    scheduledBroadcasts.delete(schedToken);
+    await executeSend(chatId, capturedPending);
+  }, delayMs);
+
+  scheduledBroadcasts.set(schedToken, {
+    adminChatId: chatId,
+    pending: capturedPending,
+    scheduledFor: fireAt,
+    label,
+    statusMessageId,
+    timerHandle,
+  });
 }
 
 // ─── /start ───────────────────────────────────────────────────────────────────
@@ -130,7 +184,7 @@ bot.command('checkgroup', async (ctx) => {
       bot.api.getChatMember(groupChatId, botId),
     ]);
 
-    const groupTitle = 'title' in chatInfo ? chatInfo.title : String(config.groupChatId);
+    const groupTitle = 'title' in chatInfo ? chatInfo.title : String(groupChatId);
 
     if (member.status === 'left' || member.status === 'kicked') {
       await ctx.reply(
@@ -143,6 +197,14 @@ bot.command('checkgroup', async (ctx) => {
     if (member.status === 'restricted') {
       await ctx.reply(
         `⚠️ Бот обмежений в групі <b>${groupTitle}</b> і не може надсилати повідомлення.`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (member.status === 'creator') {
+      await ctx.reply(
+        `✅ Бот є власником групи <b>${groupTitle}</b>. Всі права є.`,
         { parse_mode: 'HTML' },
       );
       return;
@@ -164,7 +226,6 @@ bot.command('checkgroup', async (ctx) => {
       return;
     }
 
-    // member
     await ctx.reply(
       `✅ Бот є учасником групи <b>${groupTitle}</b> і може надсилати повідомлення.`,
       { parse_mode: 'HTML' },
@@ -180,15 +241,13 @@ bot.command('checkgroup', async (ctx) => {
 bot.command('broadcast', async (ctx) => {
   if (!isAdmin(ctx.chat.id)) return;
 
+  clearSession(ctx.chat.id);
   waitingForContent.add(ctx.chat.id);
-  waitingForCustomTime.delete(ctx.chat.id);
-  pendingMessages.delete(ctx.chat.id);
 
   await ctx.reply(
     '📨 Надішліть повідомлення для групи.\n\n' +
       'Підтримується: текст, фото, відео, документ, аудіо, голосове, кружок.\n' +
       '/cancel — скасувати',
-    { parse_mode: 'HTML' },
   );
 });
 
@@ -200,12 +259,11 @@ bot.command('cancel', async (ctx) => {
 
   const hadState =
     waitingForContent.has(chatId) ||
-    waitingForCustomTime.has(chatId) ||
+    waitingForTimeInput.has(chatId) ||
+    waitingForDateInput.has(chatId) ||
     pendingMessages.has(chatId);
 
-  waitingForContent.delete(chatId);
-  waitingForCustomTime.delete(chatId);
-  pendingMessages.delete(chatId);
+  clearSession(chatId);
 
   if (hadState) {
     await ctx.reply('❌ Скасовано.');
@@ -213,11 +271,11 @@ bot.command('cancel', async (ctx) => {
     const count = [...scheduledBroadcasts.values()].filter(
       (s) => s.adminChatId === chatId,
     ).length;
-    if (count > 0) {
-      await ctx.reply(`Немає активної операції.\n\nДля керування запланованими розсилками — /scheduled`);
-    } else {
-      await ctx.reply('Немає активної операції.');
-    }
+    await ctx.reply(
+      count > 0
+        ? 'Немає активної операції.\n\nДля керування запланованими розсилками — /scheduled'
+        : 'Немає активної операції.',
+    );
   }
 });
 
@@ -256,10 +314,40 @@ bot.on('message', async (ctx) => {
   if ('text' in ctx.message && ctx.message.text?.startsWith('/')) return;
 
   const chatId = ctx.chat.id;
+  const text = ('text' in ctx.message ? ctx.message.text?.trim() : '') ?? '';
 
-  // ── Custom time input ────────────────────────────────────────────────────────
-  if (waitingForCustomTime.has(chatId)) {
-    const text = ('text' in ctx.message ? ctx.message.text?.trim() : '') ?? '';
+  // ── Date input (DD.MM or DD.MM.YYYY) ─────────────────────────────────────────
+  if (waitingForDateInput.has(chatId)) {
+    const parsed = parseDate(text);
+
+    if (!parsed) {
+      await ctx.reply(
+        'Невірний формат. Введіть дату як <b>ДД.ММ</b> або <b>ДД.ММ.РРРР</b>\nНаприклад: <code>25.04</code> або <code>25.04.2026</code>',
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (parsed.getTime() < today.getTime()) {
+      await ctx.reply('Дата в минулому. Введіть сьогоднішню або майбутню дату.');
+      return;
+    }
+
+    waitingForDateInput.delete(chatId);
+    pendingScheduleDate.set(chatId, parsed);
+    waitingForTimeInput.add(chatId);
+
+    await ctx.reply(
+      'Введіть час відправки (київський час) у форматі <b>ГГ:ХХ</b>\nНаприклад: <code>18:30</code>',
+      { parse_mode: 'HTML' },
+    );
+    return;
+  }
+
+  // ── Time input (HH:MM) ────────────────────────────────────────────────────────
+  if (waitingForTimeInput.has(chatId)) {
     const match = text.match(/^(\d{1,2}):(\d{2})$/);
 
     if (!match) {
@@ -274,50 +362,39 @@ bot.on('message', async (ctx) => {
     const minute = parseInt(match[2], 10);
 
     if (hour > 23 || minute > 59) {
-      await ctx.reply('Невірний час. Година: 0–23, хвилини: 0–59');
+      await ctx.reply('Невірний час. Година: 0–23, хвилини: 0–59.');
       return;
     }
 
     const pending = pendingMessages.get(chatId);
     if (!pending) {
-      waitingForCustomTime.delete(chatId);
+      clearSession(chatId);
       await ctx.reply('Сесія закінчилась. Почніть /broadcast заново.');
       return;
     }
 
-    waitingForCustomTime.delete(chatId);
-    pendingMessages.delete(chatId);
+    const chosenDate = pendingScheduleDate.get(chatId) ?? new Date();
+    const fireAt = new Date(chosenDate);
+    fireAt.setHours(hour, minute, 0, 0);
 
-    const fireAt = nextOccurrenceKyiv(hour, minute);
-    const delayMs = fireAt.getTime() - Date.now();
-    const fireLabel =
-      formatKyivTime(fireAt) + (isTomorrow(fireAt) ? ' (завтра)' : ' (сьогодні)');
+    if (fireAt.getTime() <= Date.now()) {
+      await ctx.reply('Цей час вже минув. Введіть майбутній час або виберіть іншу дату.');
+      return;
+    }
 
-    const capturedPending = { ...pending };
-    const schedToken = token();
-
-    const timerHandle = setTimeout(async () => {
-      scheduledBroadcasts.delete(schedToken);
-      await executeSend(chatId, capturedPending);
-    }, delayMs);
+    const label = formatScheduleLabel(fireAt);
+    clearSession(chatId);
 
     const statusMsg = await ctx.reply(
-      `⏰ Заплановано на <b>${fireLabel}</b>.\n/scheduled — керувати розсилками`,
+      `⏰ Заплановано на <b>${label}</b>.\n/scheduled — керувати розсилками`,
       { parse_mode: 'HTML' },
     );
 
-    scheduledBroadcasts.set(schedToken, {
-      adminChatId: chatId,
-      pending: capturedPending,
-      scheduledFor: fireAt,
-      label: fireLabel,
-      statusMessageId: statusMsg.message_id,
-      timerHandle,
-    });
+    scheduleAndStore(chatId, pending, fireAt, label, statusMsg.message_id);
     return;
   }
 
-  // ── Capture broadcast content ────────────────────────────────────────────────
+  // ── Capture broadcast content ─────────────────────────────────────────────────
   if (!waitingForContent.has(chatId)) return;
 
   waitingForContent.delete(chatId);
@@ -328,10 +405,9 @@ bot.on('message', async (ctx) => {
   };
   pendingMessages.set(chatId, pending);
 
-  await ctx.reply(
-    'Надіслати це повідомлення в групу?',
-    { reply_markup: buildConfirmKeyboard() },
-  );
+  await ctx.reply('Надіслати це повідомлення в групу?', {
+    reply_markup: buildConfirmKeyboard(),
+  });
 });
 
 // ─── Inline callbacks ─────────────────────────────────────────────────────────
@@ -347,7 +423,7 @@ bot.on('callback_query:data', async (ctx) => {
 
   // ── Cancel broadcast session ──────────────────────────────────────────────────
   if (data === 'cancel_broadcast') {
-    pendingMessages.delete(chatId);
+    clearSession(chatId);
     await ctx.editMessageText('❌ Розсилку скасовано.');
     await ctx.answerCallbackQuery();
     return;
@@ -378,45 +454,85 @@ bot.on('callback_query:data', async (ctx) => {
 
     const minutes = data === 'sched_30' ? 30 : data === 'sched_60' ? 60 : 120;
     const fireAt = new Date(Date.now() + minutes * 60_000);
-    const fireLabel =
-      formatKyivTime(fireAt) + (isTomorrow(fireAt) ? ' (завтра)' : ' (сьогодні)');
-    const capturedPending = { ...pending };
-    const schedToken = token();
-
-    const timerHandle = setTimeout(async () => {
-      scheduledBroadcasts.delete(schedToken);
-      await executeSend(chatId, capturedPending);
-    }, minutes * 60_000);
-
+    const label = formatScheduleLabel(fireAt);
     const schedMsgId = ctx.callbackQuery.message?.message_id ?? 0;
+
     await ctx.editMessageText(
-      `⏰ Заплановано на <b>${fireLabel}</b>.\n/scheduled — керувати розсилками`,
+      `⏰ Заплановано на <b>${label}</b>.\n/scheduled — керувати розсилками`,
       { parse_mode: 'HTML' },
     );
-    await ctx.answerCallbackQuery(`Заплановано на ${fireLabel}`);
+    await ctx.answerCallbackQuery(`Заплановано на ${label}`);
 
-    scheduledBroadcasts.set(schedToken, {
-      adminChatId: chatId,
-      pending: capturedPending,
-      scheduledFor: fireAt,
-      label: fireLabel,
-      statusMessageId: schedMsgId,
-      timerHandle,
-    });
+    scheduleAndStore(chatId, pending, fireAt, label, schedMsgId);
     return;
   }
 
-  // ── Schedule custom time ──────────────────────────────────────────────────────
+  // ── Schedule custom — show date picker ────────────────────────────────────────
   if (data === 'sched_custom') {
     const pending = pendingMessages.get(chatId);
     if (!pending) {
       await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.');
       return;
     }
-    // Keep pending, just switch to waiting for custom time
-    waitingForCustomTime.add(chatId);
+    await ctx.editMessageText('Оберіть дату відправки (київський час):', {
+      reply_markup: buildDatePickerKeyboard(),
+    });
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  // ── Date picker: Today ────────────────────────────────────────────────────────
+  if (data === 'sched_today') {
+    const pending = pendingMessages.get(chatId);
+    if (!pending) {
+      await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.');
+      return;
+    }
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    pendingScheduleDate.set(chatId, today);
+    waitingForTimeInput.add(chatId);
+
     await ctx.editMessageText(
       'Введіть час відправки (київський час) у форматі <b>ГГ:ХХ</b>\nНаприклад: <code>18:30</code>',
+      { parse_mode: 'HTML' },
+    );
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  // ── Date picker: Tomorrow ─────────────────────────────────────────────────────
+  if (data === 'sched_tomorrow') {
+    const pending = pendingMessages.get(chatId);
+    if (!pending) {
+      await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.');
+      return;
+    }
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+    pendingScheduleDate.set(chatId, tomorrow);
+    waitingForTimeInput.add(chatId);
+
+    await ctx.editMessageText(
+      'Введіть час відправки (київський час) у форматі <b>ГГ:ХХ</b>\nНаприклад: <code>18:30</code>',
+      { parse_mode: 'HTML' },
+    );
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  // ── Date picker: Custom date ──────────────────────────────────────────────────
+  if (data === 'sched_date') {
+    const pending = pendingMessages.get(chatId);
+    if (!pending) {
+      await ctx.answerCallbackQuery('Сесія закінчилась. Почніть /broadcast заново.');
+      return;
+    }
+    waitingForDateInput.add(chatId);
+
+    await ctx.editMessageText(
+      'Введіть дату у форматі <b>ДД.ММ</b> або <b>ДД.ММ.РРРР</b>\nНаприклад: <code>25.04</code> або <code>25.04.2027</code>',
       { parse_mode: 'HTML' },
     );
     await ctx.answerCallbackQuery();
@@ -458,4 +574,8 @@ bot.on('callback_query:data', async (ctx) => {
   }
 
   await ctx.answerCallbackQuery();
+});
+
+bot.catch((err) => {
+  console.error('[Bot] Uncaught error:', err);
 });
