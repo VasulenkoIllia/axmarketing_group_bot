@@ -2,8 +2,9 @@ import { bot } from './bot';
 import { config } from './config';
 
 // Fail fast if the container timezone is not set to Kyiv — all scheduling depends on it.
+// Accept both 'Europe/Kyiv' (current IANA name) and 'Europe/Kiev' (legacy alias on some systems).
 const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-if (tz !== 'Europe/Kyiv') {
+if (tz !== 'Europe/Kyiv' && tz !== 'Europe/Kiev') {
   throw new Error(
     `[Bot] Timezone must be Europe/Kyiv, got "${tz}". Set TZ=Europe/Kyiv in your environment.`,
   );
@@ -41,11 +42,22 @@ async function checkGroupAccess(): Promise<void> {
   ).catch(() => {});
 }
 
+async function setCommands(): Promise<void> {
+  await bot.api.setMyCommands([
+    { command: 'broadcast', description: 'Надіслати повідомлення в групу' },
+    { command: 'scheduled', description: 'Заплановані розсилки' },
+    { command: 'checkgroup', description: 'Перевірити доступ бота до групи' },
+    { command: 'cancel', description: 'Скасувати поточну дію' },
+    { command: 'help', description: 'Інструкція' },
+  ]);
+}
+
 bot.start({
   allowed_updates: ['message', 'callback_query'],
   onStart: async (info) => {
     console.log(`[Bot] @${info.username} started`);
     await checkGroupAccess();
+    await setCommands();
   },
 });
 

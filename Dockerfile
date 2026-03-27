@@ -13,6 +13,9 @@ RUN npm run build
 # ── Stage 2: production image ─────────────────────────────────────────────────
 FROM node:22-alpine AS runner
 
+# tzdata is required for TZ=Europe/Kyiv to work on Alpine
+RUN apk add --no-cache tzdata
+
 WORKDIR /app
 
 COPY package*.json ./
